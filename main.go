@@ -20,7 +20,7 @@ import (
 
 var (
 	client      = &http.Client{}
-	maxMessages = 100
+	maxMessages = 50
 
 	// uniqueConfigs uses a map of [protocol] -> [raw config] -> [channelName]
 	// This structure guarantees deduplication while remembering the source channel.
