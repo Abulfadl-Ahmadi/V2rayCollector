@@ -20,7 +20,7 @@ import (
 
 var (
 	client       = &http.Client{}
-	maxMessages  = 100
+	maxMessages  = 50
 	ConfigsNames = "Abulfadl Ah. "
 	configs      = map[string]string{
 		"ss":     "",
