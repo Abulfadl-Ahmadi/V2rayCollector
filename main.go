@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -11,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/jszwec/csvutil"
@@ -21,41 +19,33 @@ import (
 )
 
 var (
-	client      = &http.Client{Timeout: 10 * time.Second}
-	maxMessages = 50
-	configs     = map[string]string{
-		"ss":     "",
-		"vmess":  "",
-		"trojan": "",
-		"vless":  "",
-		"mixed":  "",
-	}
-	configsMutex sync.Mutex
+	client      = &http.Client{}
+	maxMessages = 100
 
-	// Updated regex: case‑insensitive, allow leading/trailing whitespace, and capture full URI.
+	// uniqueConfigs uses a map of [protocol] -> [raw config] -> [channelName]
+	// This structure guarantees deduplication while remembering the source channel.
+	uniqueConfigsMu sync.Mutex
+	uniqueConfigs   = map[string]map[string]string{
+		"ss":     make(map[string]string),
+		"vmess":  make(map[string]string),
+		"trojan": make(map[string]string),
+		"vless":  make(map[string]string),
+		"mixed":  make(map[string]string),
+	}
+
+	// The regex handles matching until a #, %3A%40 (encoded), or end of string ($)
 	myregex = map[string]string{
-		"ss":     `(?i)(?m)(?:\s*)(?:ss:\/\/[A-Za-z0-9+/\-_=]+@[A-Za-z0-9.\-]+:\d+)(?:\s*)(?:#|\s|$)`,
-		"vmess":  `(?i)(?m)(?:\s*)vmess:\/\/[A-Za-z0-9+/\-_=]+(?:\s*)`,
-		"trojan": `(?i)(?m)(?:\s*)trojan:\/\/[A-Za-z0-9+/\-_=]+@[A-Za-z0-9.\-]+:\d+\?(?:[^\s#]+)(?:#|\s|$)`,
-		"vless":  `(?i)(?m)(?:\s*)vless:\/\/[A-Za-z0-9+/\-_=]+@[A-Za-z0-9.\-]+:\d+\?(?:[^\s#]+)(?:#|\s|$)`,
+		"ss":     `(?m)(...ss:|^ss:)\/\/.+?(?:%3A%40|#|$)`,
+		"vmess":  `(?m)vmess:\/\/.+`,
+		"trojan": `(?m)trojan:\/\/.+?(?:%3A%40|#|$)`,
+		"vless":  `(?m)vless:\/\/.+?(?:%3A%40|#|$)`,
 	}
-
-	sort = flag.Bool("sort", false, "sort from latest to oldest (default: false)")
+	sortFlag = flag.Bool("sort", false, "sort from latest to oldest (default : false)")
 )
 
-// ChannelsType represents a channel entry from the CSV.
 type ChannelsType struct {
 	URL             string `csv:"URL"`
 	AllMessagesFlag bool   `csv:"AllMessagesFlag"`
-}
-
-// perChannelCounters holds the counters for each protocol for a single channel.
-type perChannelCounters struct {
-	ss     int32
-	vmess  int32
-	trojan int32
-	vless  int32
-	mixed  int32
 }
 
 func main() {
@@ -64,223 +54,149 @@ func main() {
 
 	fileData, err := collector.ReadFileContent("channels.csv")
 	if err != nil {
-		gologger.Fatal().Msgf("failed to read channels.csv: %v", err)
+		gologger.Fatal().Msg("error: " + err.Error())
 	}
+
 	var channels []ChannelsType
 	if err = csvutil.Unmarshal([]byte(fileData), &channels); err != nil {
-		gologger.Fatal().Msgf("failed to parse CSV: %v", err)
+		gologger.Fatal().Msg("error: " + err.Error())
 	}
 
-	// Worker pool: process up to 5 channels concurrently.
-	const maxWorkers = 5
-	sem := make(chan struct{}, maxWorkers)
 	var wg sync.WaitGroup
+	// Limit maximum concurrency to 5 routines
+	concurrencyLimit := 5
+	sem := make(chan struct{}, concurrencyLimit)
 
-	for _, ch := range channels {
+	for _, channel := range channels {
 		wg.Add(1)
-		go func(ch ChannelsType) {
+		sem <- struct{}{} // acquire token
+
+		go func(c ChannelsType) {
 			defer wg.Done()
-			sem <- struct{}{}        // acquire
-			defer func() { <-sem }() // release
+			defer func() { <-sem }() // release token
 
-			// Normalize URL to Telegram web format.
-			ch.URL = collector.ChangeUrlToTelegramWebUrl(ch.URL)
+			c.URL = collector.ChangeUrlToTelegramWebUrl(c.URL)
+			channelName := extractChannelName(c.URL)
 
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-
-			resp, err := httpRequestWithContext(ctx, ch.URL)
-			if err != nil {
-				gologger.Error().Msgf("request failed for %s: %v", ch.URL, err)
+			resp := HttpRequest(c.URL)
+			if resp == nil {
 				return
 			}
-			defer resp.Body.Close()
-
+			
 			doc, err := goquery.NewDocumentFromReader(resp.Body)
+			resp.Body.Close()
 			if err != nil {
-				gologger.Error().Msgf("failed to parse HTML for %s: %v", ch.URL, err)
+				gologger.Error().Msg(err.Error())
 				return
 			}
 
-			gologger.Info().Msgf("Crawling %s", ch.URL)
-
-			// Process this channel with its own counters.
-			counters := &perChannelCounters{}
-			crawlForV2ray(doc, ch.URL, ch.AllMessagesFlag, counters)
-
-			gologger.Info().Msgf("Crawled %s", ch.URL)
-		}(ch)
+			fmt.Println("\n---------------------------------------")
+			gologger.Info().Msg("Crawling " + c.URL)
+			CrawlForV2ray(doc, c.URL, c.AllMessagesFlag, channelName)
+			gologger.Info().Msg("Crawled " + c.URL + " ! ")
+			fmt.Println("---------------------------------------\n")
+		}(channel)
 	}
 
+	// Wait for all worker threads to finish executing
 	wg.Wait()
-	gologger.Info().Msg("All channels processed, writing output files")
 
-	// Write final files with deduplication and optional sorting.
-	for proto, content := range configs {
-		lines := collector.RemoveDuplicate(content)
-		if *sort {
-			// Newest first: split, reverse, join.
-			parts := strings.Split(lines, "\n")
-			parts = collector.Reverse(parts)
-			lines = strings.Join(parts, "\n")
-		} else {
-			// Oldest first: reverse twice (no change) but we keep it explicit.
-			parts := strings.Split(lines, "\n")
-			parts = collector.Reverse(parts)
-			parts = collector.Reverse(parts)
-			lines = strings.Join(parts, "\n")
-		}
-		lines = strings.TrimSpace(lines)
-		if lines != "" {
-			collector.WriteToFile(lines, proto+"_iran.txt")
-		}
-	}
-
-	gologger.Info().Msg("All Done")
+	generateOutputFiles()
 }
 
-// httpRequestWithContext performs a GET request with context.
-func httpRequestWithContext(ctx context.Context, url string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-	return client.Do(req)
-}
-
-// extractChannelName extracts the channel name from a Telegram web URL.
-func extractChannelName(link string) string {
-	re := regexp.MustCompile(`t\.me/([^/?]+)`)
-	matches := re.FindStringSubmatch(link)
-	if len(matches) > 1 {
-		return matches[1]
+func extractChannelName(urlStr string) string {
+	urlStr = strings.TrimSuffix(urlStr, "/")
+	parts := strings.Split(urlStr, "/")
+	if len(parts) > 0 {
+		return parts[len(parts)-1]
 	}
 	return "unknown"
 }
 
-// editVmessPs decodes a vmess link, sets the "ps" field with channel name and counter, and re‑encodes.
-func editVmessPs(config string, channelName string, counter *int32) string {
-	if config == "" {
-		return ""
+func addExtractedConfig(proto, rawConfig, channelName string) {
+	rawConfig = strings.TrimSpace(rawConfig)
+	if rawConfig == "" {
+		return
 	}
-	parts := strings.Split(config, "vmess://")
-	if len(parts) != 2 {
-		return ""
+
+	// Strip out any existing suffix tags so we have the pure URI string
+	rawConfig = strings.TrimSuffix(rawConfig, "#")
+	rawConfig = strings.TrimSuffix(rawConfig, "%3A%40")
+
+	uniqueConfigsMu.Lock()
+	defer uniqueConfigsMu.Unlock()
+
+	// Deduping step: Will only write if this raw config has not been captured globally yet
+	if _, exists := uniqueConfigs[proto][rawConfig]; !exists {
+		uniqueConfigs[proto][rawConfig] = channelName
 	}
-	decoded, err := base64.StdEncoding.DecodeString(parts[1])
-	if err != nil {
-		return ""
-	}
-	var data map[string]interface{}
-	if err := json.Unmarshal(decoded, &data); err != nil {
-		return ""
-	}
-	*counter++
-	data["ps"] = fmt.Sprintf("%s - %d", channelName, *counter)
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return ""
-	}
-	encoded := base64.StdEncoding.EncodeToString(jsonData)
-	return "vmess://" + encoded
 }
 
-// crawlForV2ray extracts configs from the document, using channel‑specific counters for naming.
-func crawlForV2ray(doc *goquery.Document, channelLink string, allMessages bool, counters *perChannelCounters) {
-	channelName := extractChannelName(channelLink)
+func CrawlForV2ray(doc *goquery.Document, channelLink string, HasAllMessagesFlag bool, channelName string) {
+	messages := doc.Find(".tgme_widget_message_wrap").Length()
+	link, exist := doc.Find(".tgme_widget_message_wrap .js-widget_message").Last().Attr("data-post")
 
-	// Load more messages if needed.
-	msgWraps := doc.Find(".tgme_widget_message_wrap")
-	messages := msgWraps.Length()
-	lastPost, exists := msgWraps.Last().Find(".js-widget_message").Attr("data-post")
-
-	if messages < maxMessages && exists {
-		number := strings.Split(lastPost, "/")[1]
-		doc = getMoreMessages(maxMessages, doc, number, channelLink)
+	if messages < maxMessages && exist {
+		number := strings.Split(link, "/")[1]
+		doc = GetMessages(maxMessages, doc, number, channelLink)
 	}
 
-	// Helper to add a config to the global map with proper naming.
-	addConfig := func(proto, rawConfig string) {
-		if rawConfig == "" {
-			return
-		}
-		var named string
-		switch proto {
-		case "vmess":
-			var ctr *int32
-			switch proto {
-			case "vmess":
-				ctr = &counters.vmess
-			default: // should not happen
-				ctr = &counters.mixed
-			}
-			named = editVmessPs(rawConfig, channelName, ctr)
-			if named == "" {
-				return
-			}
-		default:
-			// For ss, trojan, vless, append a comment.
-			var ctr *int32
-			switch proto {
-			case "ss":
-				ctr = &counters.ss
-			case "trojan":
-				ctr = &counters.trojan
-			case "vless":
-				ctr = &counters.vless
-			default:
-				ctr = &counters.mixed
-			}
-			*ctr++
-			named = fmt.Sprintf("%s #%s - %d", rawConfig, channelName, *ctr)
-		}
+	if HasAllMessagesFlag {
+		doc.Find(".tgme_widget_message_text").Each(func(j int, s *goquery.Selection) {
+			messageText, _ := s.Html()
+			str := strings.Replace(messageText, "<br/>", "\n", -1)
+			docHtml, _ := goquery.NewDocumentFromReader(strings.NewReader(str))
+			messageText = docHtml.Text()
+			lines := strings.Split(strings.TrimSpace(messageText), "\n")
+			for _, data := range lines {
+				extractedConfigs := strings.Split(ExtractConfig(data, []string{}), "\n")
+				for _, extractedConfig := range extractedConfigs {
+					extractedConfig = strings.ReplaceAll(extractedConfig, " ", "")
+					if extractedConfig != "" {
+						re := regexp.MustCompile(myregex["vmess"])
+						matches := re.FindStringSubmatch(extractedConfig)
 
-		configsMutex.Lock()
-		configs[proto] += named + "\n"
-		configsMutex.Unlock()
-	}
-
-	// Extracting configs from the document.
-	if allMessages {
-		doc.Find(".tgme_widget_message_text").Each(func(_ int, s *goquery.Selection) {
-			html, _ := s.Html()
-			text := strings.ReplaceAll(html, "<br/>", "\n")
-			subDoc, _ := goquery.NewDocumentFromReader(strings.NewReader(text))
-			msgText := subDoc.Text()
-			lines := strings.Split(msgText, "\n")
-			for _, line := range lines {
-				extracted := extractConfigs(line)
-				for _, raw := range extracted {
-					// Determine protocol by matching regex.
-					for proto, reStr := range myregex {
-						if matched, _ := regexp.MatchString(reStr, raw); matched {
-							if proto == "vmess" {
-								// For mixed we still treat as vmess with its own counter.
-								addConfig("mixed", raw)
-							} else {
-								addConfig("mixed", raw)
-							}
-							break
+						if len(matches) > 0 {
+							// For vmess configs, wipe out PS placeholder during the extraction step
+							extractedConfig = EditVmessPs(extractedConfig, false, "")
+						}
+						
+						if extractedConfig != "" {
+							addExtractedConfig("mixed", extractedConfig, channelName)
 						}
 					}
 				}
 			}
 		})
 	} else {
-		// Only code and pre tags.
-		doc.Find("code, pre").Each(func(_ int, s *goquery.Selection) {
-			html, _ := s.Html()
-			text := strings.ReplaceAll(html, "<br/>", "\n")
-			subDoc, _ := goquery.NewDocumentFromReader(strings.NewReader(text))
-			msgText := subDoc.Text()
-			lines := strings.Split(msgText, "\n")
-			for _, line := range lines {
-				extracted := extractConfigs(line)
-				for _, raw := range extracted {
-					for proto, reStr := range myregex {
-						if matched, _ := regexp.MatchString(reStr, raw); matched {
-							addConfig(proto, raw)
-							break
+		doc.Find("code,pre").Each(func(j int, s *goquery.Selection) {
+			messageText, _ := s.Html()
+			str := strings.ReplaceAll(messageText, "<br/>", "\n")
+			docHtml, _ := goquery.NewDocumentFromReader(strings.NewReader(str))
+			messageText = docHtml.Text()
+			lines := strings.Split(strings.TrimSpace(messageText), "\n")
+			for _, data := range lines {
+				extractedConfigs := strings.Split(ExtractConfig(data, []string{}), "\n")
+				for protoRegex, regexValue := range myregex {
+					for _, extractedConfig := range extractedConfigs {
+						re := regexp.MustCompile(regexValue)
+						matches := re.FindStringSubmatch(extractedConfig)
+						if len(matches) > 0 {
+							extractedConfig = strings.ReplaceAll(extractedConfig, " ", "")
+							if extractedConfig != "" {
+								if protoRegex == "vmess" {
+									extractedConfig = EditVmessPs(extractedConfig, false, "")
+								} else if protoRegex == "ss" {
+									Prefix := strings.Split(matches[0], "ss://")[0]
+									if Prefix != "" {
+										continue
+									}
+								}
+								
+								if extractedConfig != "" {
+									addExtractedConfig(protoRegex, extractedConfig, channelName)
+								}
+							}
 						}
 					}
 				}
@@ -289,58 +205,157 @@ func crawlForV2ray(doc *goquery.Document, channelLink string, allMessages bool, 
 	}
 }
 
-// extractConfigs finds all configuration strings in a text using the global regex list.
-func extractConfigs(text string) []string {
-	var found []string
-	for _, reStr := range myregex {
-		re := regexp.MustCompile(reStr)
-		matches := re.FindAllString(text, -1)
-		for _, m := range matches {
-			m = strings.TrimSpace(m)
-			if m != "" {
-				found = append(found, m)
+func ExtractConfig(Txt string, Tempconfigs []string) string {
+	for protoRegex, regexValue := range myregex {
+		re := regexp.MustCompile(regexValue)
+		matches := re.FindStringSubmatch(Txt)
+		extractedConfig := ""
+		if len(matches) > 0 {
+			if protoRegex == "ss" {
+				Prefix := strings.Split(matches[0], "ss://")[0]
+				if Prefix == "" {
+					extractedConfig = "\n" + matches[0]
+				} else if Prefix != "vle" {
+					d := strings.Split(matches[0], "ss://")
+					extractedConfig = "\n" + "ss://" + d[1]
+				}
+			} else {
+				extractedConfig = "\n" + matches[0]
+			}
+
+			Tempconfigs = append(Tempconfigs, extractedConfig)
+			Txt = strings.ReplaceAll(Txt, matches[0], "")
+			// Fix: Corrected recursive return issue
+			return ExtractConfig(Txt, Tempconfigs)
+		}
+	}
+	return strings.Join(Tempconfigs, "\n")
+}
+
+func EditVmessPs(config string, addName bool, newName string) string {
+	if config == "" {
+		return ""
+	}
+	slice := strings.Split(config, "vmess://")
+	if len(slice) > 1 {
+		decodedBytes, err := base64.StdEncoding.DecodeString(slice[1])
+		if err == nil {
+			var data map[string]interface{}
+			err = json.Unmarshal(decodedBytes, &data)
+			if err == nil {
+				if addName {
+					data["ps"] = newName
+				} else {
+					data["ps"] = ""
+				}
+
+				jsonData, _ := json.Marshal(data)
+				base64Encoded := base64.StdEncoding.EncodeToString(jsonData)
+				return "vmess://" + base64Encoded
 			}
 		}
 	}
-	return found
+	// return original payload if standard parsing fails
+	return config
 }
 
-// getMoreMessages recursively loads older messages until we have at least maxMessages.
-func getMoreMessages(limit int, doc *goquery.Document, before string, channel string) *goquery.Document {
-	url := channel + "?before=" + before
-	req, _ := http.NewRequest("GET", url, nil)
+func generateOutputFiles() {
+	gologger.Info().Msg("Creating output files !")
+
+	// Keep an isolated count sequence mapped to individual channel sources
+	channelCounters := make(map[string]int)
+
+	for proto, configMap := range uniqueConfigs {
+		var linesArr []string
+
+		for rawConfig, channelName := range configMap {
+			channelCounters[channelName]++
+			counter := channelCounters[channelName]
+			// Generates dynamic ID: e.g. "v2ray_configs - 1"
+			newName := fmt.Sprintf("%s - %d", channelName, counter)
+
+			finalConfig := applyConfigName(proto, rawConfig, newName)
+			if finalConfig != "" {
+				linesArr = append(linesArr, finalConfig)
+			}
+		}
+
+		if *sortFlag {
+			linesArr = collector.Reverse(linesArr)
+		} else {
+			linesArr = collector.Reverse(linesArr)
+			linesArr = collector.Reverse(linesArr)
+		}
+
+		lines := strings.Join(linesArr, "\n")
+		lines = strings.TrimSpace(lines)
+		if lines != "" {
+			collector.WriteToFile(lines, proto+"_iran.txt")
+		}
+	}
+
+	gologger.Info().Msg("All Done :D")
+}
+
+func applyConfigName(proto, rawConfig, newName string) string {
+	if proto == "vmess" || strings.HasPrefix(rawConfig, "vmess://") {
+		return EditVmessPs(rawConfig, true, newName)
+	}
+	// Append # trailing name for trojan, ss, vless and general mixed
+	return rawConfig + "#" + newName
+}
+
+func loadMore(link string) *goquery.Document {
+	req, _ := http.NewRequest("GET", link, nil)
 	resp, err := client.Do(req)
 	if err != nil {
-		gologger.Error().Msgf("failed to load more messages: %v", err)
-		return doc
+		return nil
 	}
 	defer resp.Body.Close()
+	doc, _ := goquery.NewDocumentFromReader(resp.Body)
+	return doc
+}
 
-	newDoc, err := goquery.NewDocumentFromReader(resp.Body)
+func HttpRequest(url string) *http.Response {
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		gologger.Error().Msgf("failed to parse more messages: %v", err)
+		gologger.Error().Msg(fmt.Sprintf("Error When requesting to: %s Error : %s", url, err))
+		return nil
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		gologger.Error().Msg(err.Error())
+		return nil
+	}
+	return resp
+}
+
+func GetMessages(length int, doc *goquery.Document, number string, channel string) *goquery.Document {
+	x := loadMore(channel + "?before=" + number)
+	if x == nil {
 		return doc
 	}
 
-	// Append new nodes to existing doc.
-	doc.Find("body").AppendSelection(newDoc.Find("body").Children())
-	merged := goquery.NewDocumentFromNode(doc.Selection.Nodes[0])
+	html2, _ := x.Html()
+	reader2 := strings.NewReader(html2)
+	doc2, _ := goquery.NewDocumentFromReader(reader2)
 
-	count := merged.Find(".js-widget_message_wrap").Length()
-	if count >= limit {
-		return merged
-	}
+	doc.Find("body").AppendSelection(doc2.Find("body").Children())
+	newDoc := goquery.NewDocumentFromNode(doc.Selection.Nodes[0])
+	messages := newDoc.Find(".js-widget_message_wrap").Length()
 
-	// Find last post id from the newly added messages.
-	last := merged.Find(".js-widget_message_wrap").Last().Find(".js-widget_message")
-	post, exists := last.Attr("data-post")
-	if !exists {
-		return merged
+	if messages > length {
+		return newDoc
+	} else {
+		num, _ := strconv.Atoi(number)
+		n := num - 21
+		if n > 0 {
+			ns := strconv.Itoa(n)
+			// Fix: Corrected recursive scope return for infinite loops issue
+			return GetMessages(length, newDoc, ns, channel)
+		} else {
+			return newDoc
+		}
 	}
-	numStr := strings.Split(post, "/")[1]
-	num, _ := strconv.Atoi(numStr)
-	if num <= 21 {
-		return merged
-	}
-	return getMoreMessages(limit, merged, strconv.Itoa(num-21), channel)
 }
